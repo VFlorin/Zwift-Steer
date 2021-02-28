@@ -1,0 +1,306 @@
+/*
+    Zwift Steering Simulator
+    Takes ADC reading from pin 32 and maps it to an angle from -35 to 35
+    Then transmits it to Zwift via BLE
+    
+    Inspired in samples by Kolban (ESP32 and BLE Arduino) & Peter Everett
+    Thanks to Keith Wakeham's for his protocol explanation https://www.youtube.com/watch?v=BPVFjz5zD4g
+    Thanks to fiveohhh for the demo code https://github.com/fiveohhh/zwift-steerer/
+    
+    Written on Arduino IDE 1.8.13
+    
+    Licensed under GNU GPL-3
+
+*/
+
+/*
+  This is a small change to set the angle based on 2 touch pins of the ESP32 wroom kit ( T0 and T4 ), instead of the joystick. 
+  Nothing fancy, but for me works better than with the joystick, because i've got a crappy one, and didn't like the readings at all.
+  Basically you only need 2 simple wires and the ESP32. (no joystick required)
+  I've used some 1cm diameter circles cut from a pcb board, stiched some very small magnets and i can attach and detach these touch pads from the bike hoods. 
+*/
+
+//Libraries
+
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+//DEBUG
+#define DEBUG
+
+//BLE Definitions
+#define STEERING_DEVICE_UUID "347b0001-7635-408b-8918-8ff3949ce592"
+#define STEERING_ANGLE_CHAR_UUID "347b0030-7635-408b-8918-8ff3949ce592" //notify
+#define STEERING_RX_CHAR_UUID "347b0031-7635-408b-8918-8ff3949ce592"    //write
+#define STEERING_TX_CHAR_UUID "347b0032-7635-408b-8918-8ff3949ce592"    //indicate
+
+//Angle calculation parametres
+#define MAX_ADC_RESOLUTION 4095 //ESP32 ADC is 12bit
+#define MAX_STEER_ANGLE 35
+#define ZERO_FLOOR 2
+
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+bool auth = false;
+
+// touch threshold
+// D4 DI3 on the small dev board
+int touchThreshold = 20;
+int touchLeftInitial = 80;
+int touchRightInitial = 80;
+int touchTimer = 0;
+
+float angle = 0;
+//Sterzo stuff
+int FF = 0xFF;
+uint8_t authChallenge[4] = {0x03, 0x10, 0xff, 0xff};
+uint8_t authSuccess[3] = {0x03, 0x11, 0xff};
+
+BLEServer *pServer = NULL;
+BLECharacteristic *pAngle = NULL;
+BLECharacteristic *pRx = NULL;
+BLECharacteristic *pTx = NULL;
+BLEAdvertising *pAdvertising;
+
+//Server Callbacks
+class MyServerCallbacks : public BLEServerCallbacks
+{
+    void onConnect(BLEServer *pServer)
+    {
+        deviceConnected = true;
+        BLEDevice::startAdvertising();
+        
+    };
+
+    void onDisconnect(BLEServer *pServer)
+    {
+        deviceConnected = false;
+    }
+};
+
+//Characteristic Callbacks
+class MyCharacteristicCallbacks : public BLECharacteristicCallbacks
+{
+
+    void onRead(BLECharacteristic *pRx)
+    {
+
+    }
+
+    void onWrite(BLECharacteristic *pRx){
+
+        std::string rxValue = pRx->getValue();
+        
+        if(rxValue.length() == 4){
+          delay(250);
+          pTx->setValue(authSuccess,3);
+          pTx->indicate();
+          auth = true;
+          #ifdef DEBUG
+          Serial.println("Auth Success!");
+          #endif
+        }
+    }
+};
+
+float readAngleTouch()
+{
+  bool touched = false;
+  int left = touchRead(T0);
+  int right = touchRead(T4);
+
+  // double readings to be sure
+  if ((touchLeftInitial-left) > touchThreshold)
+  {
+    left = touchRead(T0);
+  }
+  if ((touchRightInitial-right) > touchThreshold)
+  {
+    right = touchRead(T4);
+  }
+
+  #ifdef DEBUG
+  Serial.print("L: ");
+  Serial.println(left);
+  Serial.print("R: ");
+  Serial.println(right);
+  #endif
+
+  // touched left
+  if ((touchLeftInitial-left) > touchThreshold)
+  {
+    touched = true;
+    #ifdef DEBUG
+    Serial.println("minus");
+    #endif 
+    
+    if (angle > 0)
+    {
+      angle = 0;
+      touchTimer = 0;
+    }
+    else
+    {
+      touchTimer += 5;
+    }
+    angle -= touchTimer;   
+  }
+
+  // touched right
+  if ((touchRightInitial-right) > touchThreshold)
+  {
+    touched = true;
+    #ifdef DEBUG
+    Serial.println("plus");
+    #endif
+    
+    if (angle < 0)
+    {
+      angle = 0;
+      touchTimer = 0;
+    }
+    else
+    {
+      touchTimer += 5;
+    }
+    angle += touchTimer;   
+  }  
+
+  // if no button was touched - return back to zero
+  if (!touched)
+  {
+    angle = 0;
+    touchTimer = 0;
+  }
+
+  if (abs(angle) > MAX_STEER_ANGLE)
+    if (angle < 0)
+      angle = -MAX_STEER_ANGLE;
+    else
+      angle = MAX_STEER_ANGLE;
+
+  if (fabsf(angle) < ZERO_FLOOR){
+      angle = 0;
+  }  
+
+  return angle;
+}
+
+
+//Arduino setup
+void setup()
+{
+    //Serial Debug
+    Serial.begin(115200);
+    
+    touchLeftInitial = touchRead(T0);
+    touchRightInitial = touchRead(T4);
+   
+    //Setup BLE
+    #ifdef DEBUG
+    Serial.println("Creating BLE server...");
+    #endif
+    BLEDevice::init("STEERING");
+
+    // Create the BLE Server
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+
+    // Create the BLE Service
+    #ifdef DEBUG
+    Serial.println("Define service...");
+    #endif
+    BLEService *pService = pServer->createService(STEERING_DEVICE_UUID);
+
+    // Create BLE Characteristics
+    #ifdef DEBUG
+    Serial.println("Define characteristics");
+    #endif
+    pTx = pService->createCharacteristic(STEERING_TX_CHAR_UUID, BLECharacteristic::PROPERTY_INDICATE | BLECharacteristic::PROPERTY_READ);
+    pTx->addDescriptor(new BLE2902());
+    
+    pRx = pService->createCharacteristic(STEERING_RX_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE);
+    pRx->addDescriptor(new BLE2902());
+    pRx->setCallbacks(new MyCharacteristicCallbacks());
+
+    pAngle = pService->createCharacteristic(STEERING_ANGLE_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    pAngle->addDescriptor(new BLE2902());
+
+    // Start the service
+    #ifdef DEBUG
+    Serial.println("Staring BLE service...");
+    #endif
+    pService->start();
+
+    // Start advertising
+    #ifdef DEBUG
+    Serial.println("Define the advertiser...");
+    #endif
+    pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->setScanResponse(true);
+    pAdvertising->addServiceUUID(STEERING_DEVICE_UUID);
+    pAdvertising->setMinPreferred(0x06); // set value to 0x00 to not advertise this parameter
+    #ifdef DEBUG
+    Serial.println("Starting advertiser...");
+    #endif
+    BLEDevice::startAdvertising();
+    #ifdef DEBUG
+    Serial.println("Waiting a client connection to notify...");
+    #endif
+}
+
+//Arduino loop
+void loop()
+{
+
+    if (deviceConnected)
+    {
+        
+        if(auth){
+          angle = readAngleTouch();
+          pAngle->setValue(angle);
+          pAngle->notify();
+          #ifdef DEBUG
+          //Serial.print("TX Angle: ");
+          //Serial.println(angle);
+          #endif
+          delay(250);
+        } else {
+          #ifdef DEBUG
+          Serial.println("Auth Challenging");
+          #endif
+          pTx->setValue(authChallenge, 4);
+          pTx->indicate();
+          delay(250);
+        
+        }
+    }
+
+    //Advertising
+    if (!deviceConnected && oldDeviceConnected)
+    {
+        delay(300);                  // give the bluetooth stack the chance to get things ready
+        pServer->startAdvertising(); // restart advertising
+        #ifdef DEBUG
+        Serial.println("Nothing connected, start advertising");
+        #endif
+        oldDeviceConnected = deviceConnected;
+    }
+   
+    //Connecting
+    if (deviceConnected && !oldDeviceConnected)
+    {
+        oldDeviceConnected = deviceConnected;
+        #ifdef DEBUG
+        Serial.println("Connecting...");
+        #endif
+    }
+
+    if (!deviceConnected)
+    {
+        //Nothing
+    }
+}
